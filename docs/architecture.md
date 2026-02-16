@@ -1,15 +1,6 @@
-# AgentFlow
+# Chorus
 
 **Agent-Native Project Management System**
-
-*Project Design Document*
-
-| | |
-|---|---|
-| **Version** | 1.0 - Initial Design |
-| **Date** | February 10, 2026 |
-| **Status** | Design Phase |
-| **Inspired By** | Hansoft, Beads, Agile/SCRUM |
 
 ## Table of Contents
 
@@ -27,22 +18,18 @@
 - [Project Structure](#project-structure)
 - [Implementation Plan](#implementation-plan)
 - [Key Design Decisions](#key-design-decisions)
-- [Lessons from Beads](#lessons-from-beads)
-- [Future Considerations](#future-considerations)
 
 ## Executive Summary
 
-AgentFlow is a project management system designed from the ground up for AI coding agents. Unlike traditional project management tools built for human teams, AgentFlow addresses the unique challenges of coordinating AI agents: context window limitations, the need for atomic and well-scoped tasks, structured handoffs between agents, and a complexity scoring system calibrated to how LLMs actually fail.
+Chorus is a project management system intended for working with AI agents on more complicated tasks. The project focuse letting agents help break down and define tasks to then work on those tasks when sufficiently defined. The system provides hierarchical task management with infinite nesting, a complexity scoring framework, basic locking for multi-agent concurrency. An autonomy mode system controls whether agents can freely operate on projects and tasks or whether human review gates are enforced. Tasks flow through a pipeline of atomic operations — sizing, breakdown, refinement, review, and implementation — each performed by a single agent in a single session.
 
-The system provides hierarchical task management with infinite nesting, a five-dimension complexity scoring framework, pessimistic locking for safe multi-agent concurrency, and structured work logs that enable clean context handoffs between agents. An autonomy mode system controls whether agents can freely operate on projects and tasks or whether human review gates are enforced. Tasks flow through a pipeline of atomic operations — sizing, breakdown, refinement, review, and implementation — each performed by a single agent in a single session.
-
-AgentFlow exposes a REST API backed by PostgreSQL, agent skill files that teach coding agents like Claude Code and Cursor how to interact with the system, and a React frontend for human oversight and project management.
+Chorus exposes a REST API backed by PostgreSQL, agent skill files that teach coding agents like Claude Code and Cursor how to interact with the system, and a React frontend for human oversight and project management.
 
 ## Core Concepts
 
 ### Hierarchical Task Structure
 
-Tasks are the central entity in AgentFlow. Every task can have any number of subtasks, forming an infinitely nestable hierarchy using an adjacency list pattern (each task references its parent). This enables progressive decomposition: a high-level feature like "Implement Frontend" can be broken into pages, then components, then individual implementation units — each small enough for an agent to execute in a single session.
+Tasks are the central entity in Chorus. Every task can have any number of subtasks, forming an infinitely nestable hierarchy where each task references its parent. This enables progressive decomposition: a high-level feature like "Implement Frontend" can be broken into pages, then components, then individual implementation units — each small enough for an agent to execute in a single session.
 
 Each task carries two text fields that serve distinct purposes. The **description** defines what the task is: its goal, requirements, and acceptance criteria. The **context** field explains how the task fits into the larger picture, capturing relevant information from parent tasks and cross-cutting concerns. When an agent breaks down a parent task, it writes context on each child summarizing the relevant parts of the parent, effectively pre-computing the context traversal so implementation agents have everything they need without walking the tree.
 
@@ -67,9 +54,7 @@ Tasks have a simple four-state lifecycle. Status tracks execution state only —
 | Done | Implementation is complete |
 | Won't Do | Task has been cancelled or determined unnecessary |
 
-### Computed Readiness
-
-Rather than maintaining a separate readiness state that can drift from reality, AgentFlow derives task readiness from the task's actual data. This eliminates dual sources of truth and ensures what you see always reflects what exists.
+### Task Readiness
 
 The system computes readiness using the following logic, evaluated in priority order. The "Pending Review" state only applies to tasks in `manual` mode — in `agent` mode, the review gate is skipped.
 
@@ -89,7 +74,7 @@ Projects are organizational containers for tasks. Each project has a name and de
 
 ## Autonomy Mode
 
-AgentFlow supports two modes of operation that control whether AI agents can interact with a project or task. This is enforced at the API layer, not just advisory.
+Chorus supports two modes of operation that control whether AI agents can interact with a project or task. This is enforced at the API layer, not just advisory.
 
 ### Modes
 
@@ -112,7 +97,7 @@ The API computes and returns `effective_autonomy_mode` on every task response. T
 
 ### API Enforcement
 
-Enforcement happens at the API layer using the requesting agent's identity. Every agent registers in the system with an `agent_type` (e.g., `claude_code`, `cursor`, `human`). When a mutation endpoint receives a request for a task whose effective mode is `manual`:
+Enforcement happens at the API layer using the requesting agent's identity. Every agent session registers in the system with a `session_id` and `agent_type` (e.g., `claude_code`, `cursor`, `human`). When a mutation endpoint receives a request for a task whose effective mode is `manual`:
 
 - If the requester's `agent_type` is non-human: the API returns **403 Forbidden** with a message explaining the task is in manual mode.
 - If the requester's `agent_type` is `human`: the request proceeds normally.
@@ -125,7 +110,7 @@ The skill file reinforces this by teaching agents to only look for `agent`-mode 
 
 ## Complexity Scoring Framework
 
-Traditional task estimation is based on human time, which is irrelevant for AI agents. An agent might complete routine work in seconds but fail completely on a task a human finds straightforward. AgentFlow uses a five-dimension complexity scoring system calibrated to how LLMs actually fail.
+Traditional task estimation is based on human time, which is irrelevant for AI agents. An agent might complete routine work in seconds but fail completely on a task a human finds straightforward. Chorus uses a five-dimension complexity scoring system calibrated to how LLMs actually fail.
 
 ### Scoring Dimensions
 
@@ -197,17 +182,27 @@ Every interaction an agent has with a task is an atomic operation: a single, sel
 
 ### Task Locking
 
-AgentFlow uses pessimistic locking to ensure only one agent operates on a task at a time. When an agent takes a task, it acquires an exclusive lock specifying the operation purpose. Other agents see the task as locked and skip it. Locks have an expiration time to prevent zombie locks from crashed or abandoned agent sessions. Agents send periodic heartbeats to keep their locks alive.
+Chorus uses pessimistic locking to ensure only one agent operates on a task at a time. When an agent takes a task, it acquires an exclusive lock specifying the operation purpose. Other agents see the task as locked and skip it. Locks have a TTL-based expiration time to prevent zombie locks from crashed or abandoned agent sessions. The TTL is set automatically based on the lock purpose — no heartbeat or background process is required.
+
+TTL per lock purpose:
+
+| Lock Purpose | TTL |
+|---|---|
+| sizing | 15 minutes |
+| breakdown | 30 minutes |
+| refinement | 30 minutes |
+| implementation | 1 hour |
+
+When a lock is acquired, the server computes `expires_at` from the purpose-based TTL. If an existing lock has expired at the time a new acquisition is attempted, the server releases the stale lock and grants the new request. A background cleanup task also periodically sweeps expired locks. Humans (project owners) can force-release any lock via `DELETE /tasks/{id}/lock`, even locks they don't hold.
 
 The locking protocol:
 
 | Step | Action | Details |
 |---|---|---|
-| 1 | Acquire | Agent requests a lock with a purpose (sizing, breakdown, refinement, implementation). The server validates that the task is in an appropriate state for the requested operation and that no existing lock is held. |
-| 2 | Heartbeat | Agent periodically pings the lock endpoint to signal it is still active. If heartbeats stop and the lock expires, another agent can claim the task. |
-| 3 | Operate | Agent performs its atomic operation. The lock purpose constrains what operations are valid. |
-| 4 | Log | Agent writes a work log entry describing what it did, decisions it made, and any issues encountered. |
-| 5 | Release | Agent explicitly releases the lock. If the agent crashes, the expiry handles cleanup. |
+| 1 | Acquire | Agent requests a lock with a purpose (sizing, breakdown, refinement, implementation). The server validates that the task is in an appropriate state for the requested operation and that no unexpired lock is held. If an expired lock exists, it is released automatically. |
+| 2 | Operate | Agent performs its atomic operation. The lock purpose constrains what operations are valid. |
+| 3 | Log | Agent writes a work log entry describing what it did, decisions it made, and any issues encountered. |
+| 4 | Release | Agent explicitly releases the lock. If the agent crashes, the TTL expiry handles cleanup. |
 
 Lock validation rules enforced by the API:
 
@@ -235,7 +230,7 @@ Agents need to understand how their task fits into the broader project. The API 
 
 ### Parent-Child Consistency
 
-When breaking down tasks, agents may arrive at conclusions that diverge from the parent task's original description. AgentFlow addresses this with two conventions. First, parent descriptions should be summaries of goals and scope, not implementation details — the subtasks are where specifics live. Second, when a breakdown changes the parent's intent, the agent updates the parent description and explicitly documents the change in the work log. The context field on child tasks captures relevant parent information at the time of breakdown, and the system can flag when a parent has been modified after its children's context was written.
+When breaking down tasks, agents may arrive at conclusions that diverge from the parent task's original description. Chorus addresses this with two conventions. First, parent descriptions should be summaries of goals and scope, not implementation details — the subtasks are where specifics live. Second, when a breakdown changes the parent's intent, the agent updates the parent description and explicitly documents the change in the work log. The context field on child tasks captures relevant parent information at the time of breakdown, and the system can flag when a parent has been modified after its children's context was written.
 
 ## Task Lifecycle
 
@@ -303,11 +298,10 @@ The data model consists of six entities. Projects contain Tasks in a hierarchy. 
 |---|---|---|---|
 | id | UUID | PK | Unique identifier |
 | task_id | UUID | FK -> Tasks, UNIQUE | One lock per task |
-| agent_id | UUID | FK -> Agents, NOT NULL | Agent holding the lock |
+| agent_id | UUID | FK -> Agents, NOT NULL | Agent session holding the lock |
 | lock_purpose | ENUM | NOT NULL | sizing, breakdown, refinement, implementation |
 | acquired_at | TIMESTAMP | NOT NULL, DEFAULT NOW | When the lock was acquired |
-| expires_at | TIMESTAMP | NOT NULL | Auto-release time if no heartbeat |
-| heartbeat_at | TIMESTAMP | NOT NULL, DEFAULT NOW | Last heartbeat from agent |
+| expires_at | TIMESTAMP | NOT NULL | Auto-release time (set from purpose-based TTL) |
 
 ### Task Commits
 
@@ -336,7 +330,7 @@ The data model consists of six entities. Projects contain Tasks in a hierarchy. 
 | Column | Type | Constraints | Description |
 |---|---|---|---|
 | id | UUID | PK | Unique identifier |
-| name | VARCHAR(255) | NOT NULL | Display name |
+| session_id | VARCHAR | NOT NULL, UNIQUE | The agent's session identifier (e.g. Claude Code session ID) |
 | agent_type | VARCHAR(100) | NOT NULL | e.g. claude_code, cursor, human |
 | created_at | TIMESTAMP | NOT NULL, DEFAULT NOW | Registration timestamp |
 
@@ -377,7 +371,7 @@ The system is composed of three runtime components and a set of static skill fil
 
 **React Frontend** — The human interface. Provides a tree view of the task hierarchy, a task detail panel with sizing breakdown visualization, a review queue for pending tasks, and a kanban-style board for tracking execution status. Communicates exclusively through the REST API.
 
-**Agent Skill Files** — Markdown documentation that teaches coding agents how to interact with AgentFlow. Agents read the skill file to learn API endpoints, workflow patterns, and the sizing rubric, then make HTTP calls directly against the REST API. No intermediary process is needed — the skill file is the agent interface.
+**Agent Skill Files** — Markdown documentation that teaches coding agents how to interact with Chorus. Agents read the skill file to learn API endpoints, workflow patterns, and the sizing rubric, then make HTTP calls directly against the REST API. No intermediary process is needed — the skill file is the agent interface.
 
 ## API Design
 
@@ -421,9 +415,8 @@ The system is composed of three runtime components and a set of static skill fil
 
 | Method | Path | Description |
 |---|---|---|
-| POST | /tasks/{id}/lock | Acquire lock (agent_id, purpose). Validates preconditions. |
-| DELETE | /tasks/{id}/lock | Release lock. Agent must be the lock holder. |
-| POST | /tasks/{id}/lock/heartbeat | Keep-alive ping from the agent. |
+| POST | /tasks/{id}/lock | Acquire lock (agent_id, purpose). Validates preconditions. Sets expires_at from purpose-based TTL. |
+| DELETE | /tasks/{id}/lock | Release lock. Agent must be the lock holder, or requester must be a project owner (force-release). |
 
 ### Work Log and Commit Endpoints
 
@@ -448,14 +441,14 @@ The system is composed of three runtime components and a set of static skill fil
 
 | Method | Path | Description |
 |---|---|---|
-| POST | /agents | Register a new agent |
-| GET | /agents | List all agents |
-| GET | /agents/{id} | Get agent details |
-| GET | /agents/{id}/tasks | Get tasks currently locked by this agent |
+| POST | /agents | Register a new agent session (session_id, agent_type). Returns agent id for subsequent requests. |
+| GET | /agents | List all agent sessions |
+| GET | /agents/{id} | Get agent session details |
+| GET | /agents/{id}/tasks | Get tasks currently locked by this agent session |
 
 ## Agent Skill Design
 
-Agent skills are markdown files that teach coding agents (Claude Code, Cursor) how to interact with AgentFlow. Rather than running a separate intermediary process, agents read the skill file and make HTTP calls directly against the REST API. This is simpler to maintain, requires no additional infrastructure, and works with any agent that can read files and make HTTP requests.
+Agent skills are markdown files that teach coding agents (Claude Code, Cursor) how to interact with Chorus. Rather than running a separate intermediary process, agents read the skill file and make HTTP calls directly against the REST API. This is simpler to maintain, requires no additional infrastructure, and works with any agent that can read files and make HTTP requests.
 
 ### Skill File Contents
 
@@ -463,7 +456,7 @@ The skill file encodes everything an agent needs to operate:
 
 | Section | Content |
 |---|---|
-| Overview | What AgentFlow is, how autonomy mode works, what the agent should check before operating on any task |
+| Overview | What Chorus is, how autonomy mode works, what the agent should check before operating on any task |
 | API Reference | Base URL, authentication, key endpoints with request/response examples |
 | Sizing Rubric | The five-dimension scoring framework with scoring guidelines and examples |
 | Workflow Patterns | Step-by-step procedures for each atomic operation |
@@ -508,7 +501,7 @@ The React frontend serves as the human oversight interface. While agents interac
 ## Project Structure
 
 ```
-agentflow/
+chorus/
 ├── docker-compose.yml
 ├── backend/
 │   ├── app/
@@ -533,7 +526,7 @@ agentflow/
 │   │   │   └── dependencies.py         # DB session, common deps
 │   │   ├── services/                   # Business logic
 │   │   │   ├── task_service.py         # Computed fields, tree ops, rollup
-│   │   │   ├── lock_service.py         # Acquire, release, heartbeat, expiry
+│   │   │   ├── lock_service.py         # Acquire, release, TTL expiry cleanup
 │   │   │   └── sizing_service.py       # Scoring validation, breakdown triggers
 │   │   └── db/
 │   │       ├── session.py              # AsyncSession factory
@@ -550,7 +543,7 @@ agentflow/
 │   ├── Dockerfile
 │   └── package.json
 └── skills/
-    └── agentflow/
+    └── chorus/
         └── SKILL.md                    # Complete agent skill: API reference, workflow patterns, sizing rubric
 ```
 
@@ -562,7 +555,7 @@ The build order prioritizes proving the agent interaction loop early. The fronte
 |---|---|---|
 | Phase 1 | Database + Schema | Docker Compose with PostgreSQL. Alembic migrations for all six entities. SQLAlchemy models with relationships and constraints. |
 | Phase 2 | Core API | FastAPI application with CRUD endpoints for projects, tasks, agents. Business logic services for computed readiness, point rollup (recursive CTE), tree operations. Pydantic schemas for all request/response models. |
-| Phase 3 | Locking + Operations | Lock acquisition with precondition validation, heartbeat, expiry cleanup (background task). Atomic operation endpoints: size, breakdown, refine, approve. State transition validation. Autonomy mode enforcement on all mutation endpoints. |
+| Phase 3 | Locking + Operations | Lock acquisition with precondition validation, TTL-based expiry, expiry cleanup (background task). Atomic operation endpoints: size, breakdown, refine, approve. State transition validation. Autonomy mode enforcement on all mutation endpoints. |
 | Phase 4 | Agent Skill File | Markdown skill file encoding workflow patterns, sizing rubric, API reference, and autonomy mode guidance. Test with Claude Code: create project, size tasks, break down, implement. |
 | Phase 5 | Frontend | React + Vite application. Task tree view with collapsible hierarchy. Task detail panel. Review queue. Kanban board. Agent activity dashboard. |
 | Phase 6 | Polish + Iterate | Refine based on real usage. Add bulk operations, task search/filter, project-level analytics, export to markdown (TASKS.md in repo). |
@@ -575,43 +568,10 @@ The build order prioritizes proving the agent interaction loop early. The fronte
 | Readiness model | Computed from data, not stored | Eliminates dual sources of truth. `needs_refinement` is the only stored flag because it represents a judgment call that cannot be inferred. All other readiness states are derived from `points`, children, and `approved` fields. |
 | Point rollup | Replacement model | Once a task is broken down and children are sized, the children are the source of truth. The parent's original estimate is preserved for context but superseded. This prevents double-counting and makes the hierarchy the canonical sizing. |
 | Operations | Atomic, single-purpose | Agents have limited context windows and no memory between sessions. Atomic operations keep context contained, enable clean handoffs, and allow review gates between steps. |
-| Locking | Pessimistic with expiry | Prevents conflicting concurrent modifications. Expiry handles agent crashes. Heartbeats distinguish active work from abandoned sessions. Simpler and more predictable than optimistic concurrency for agent workloads. |
+| Locking | Pessimistic with TTL expiry | Prevents conflicting concurrent modifications. Purpose-based TTLs handle agent crashes without requiring heartbeats — important because Claude Code and Cursor run as ephemeral sessions that cannot maintain background processes. Lock acquisition checks expiry inline for immediate reclamation. Simpler and more predictable than optimistic concurrency for agent workloads. |
 | Frontend framework | React + Vite over Next.js | No SSR, SEO, or server-side routing needed. This is a dashboard app that talks to a separate API. Vite is lighter weight with faster dev experience. |
 | Autonomy mode | Two modes with API enforcement | `agent` and `manual` modes enforced at the API layer via agent identity, not just advisory flags. Non-human agents receive 403 on manual-mode tasks. Discovery endpoints filter by mode so agents never see work they cannot act on. Override inheritance flows down the task tree, allowing fine-grained control within a project. |
 | Work logs | Separate table, not text field | Multiple agents perform atomic operations. Structured entries with agent, operation, and timestamp enable querying, filtering, and timeline display. Append-only prevents accidental overwrites. |
 | Skills over MCP | Skill files instead of MCP server | A well-written skill file teaches agents the API endpoints, workflow patterns, and sizing rubric — agents make HTTP calls directly. No intermediary process to run or maintain. MCP can be added later if a use case demands it, but for Claude Code and Cursor, skills are sufficient and simpler. |
 | Skills before frontend | Build order prioritizes agent integration | The system's primary users are agents. Proving the agent interaction loop (create -> size -> break down -> implement) is more valuable than a GUI for validating the design. |
 
-## Lessons from Beads
-
-The Beads project (github.com/steveyegge/beads) is a lightweight, git-backed issue tracker designed for AI coding agents. While AgentFlow takes a different architectural approach (relational database + REST API vs. file-based JSONL), several concepts from Beads inform the design:
-
-| Beads Concept | AgentFlow Adaptation |
-|---|---|
-| Ready work detection — automatically finding issues with no open blockers | Computed readiness as a first-class concept. The `/tasks/available` endpoint with operation-type filtering serves the same purpose: agents query for what they can work on next without manual triage. |
-| Discovered-from relationships — agents file new issues linked to their discovery context | The discovery workflow pattern in the skill file: when an implementation agent notices new work, it creates a task linked to the current context rather than expanding scope. |
-| Agent onboarding — `bd onboard` gives agents project context instantly | The `/projects/{id}/context` and `/tasks/{id}/context` endpoints serve this purpose. The skill file teaches agents to call `GET /tasks/{id}/context` to get everything they need to orient themselves. |
-| Audit trail — every change is logged for reconstruction | Work log entries record every atomic operation with agent, operation type, and content. Enables full reconstruction of a task's history across multiple agent sessions. |
-| Git integration — issues live alongside code | Commit tracking as task metadata. Phase 7 includes export to TASKS.md in the repo for visibility without API access. |
-
-## Future Considerations
-
-### Task Dependencies
-
-The current design uses only parent-child relationships. Future iterations should consider adding explicit dependency relationships (blocks/blocked-by) to enable topological ordering of work. This would enhance the ready work detection: a task is only ready when it is sized, approved, and all blocking tasks are done.
-
-### PM Agent
-
-A dedicated PM agent could automate the review gate: examining sizing assessments, verifying description quality, checking that breakdowns are reasonable, and approving tasks that meet quality thresholds. This would reduce the human bottleneck while maintaining quality control.
-
-### Analytics and Reporting
-
-Tracking agent performance over time: which agents complete tasks reliably, how accurate are sizing estimates compared to actual effort, which complexity dimensions most often cause failures. This data would inform both the sizing rubric calibration and agent assignment decisions.
-
-### Multi-Repository Support
-
-Linking projects to specific repositories and enabling cross-repository task relationships. This would support projects that span multiple codebases.
-
-### Template Tasks
-
-Pre-defined task hierarchies for common patterns (e.g., "add a new API endpoint" always breaks down into: route handler, service method, tests, documentation). Templates would accelerate breakdown and ensure consistency.
