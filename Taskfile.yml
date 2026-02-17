@@ -1,0 +1,61 @@
+version: "3"
+
+tasks:
+  up:
+    desc: Start all services (detached)
+    cmd: docker compose up --build -d
+
+  down:
+    desc: Stop all services
+    cmd: docker compose down
+
+  logs:
+    desc: Tail logs (pass service name via CLI_ARGS, e.g. task logs -- backend)
+    cmd: docker compose logs -f {{.CLI_ARGS}}
+
+  db:migrate:
+    desc: Run migrations to head
+    cmd: docker compose exec backend alembic upgrade head
+
+  db:migration:
+    desc: Create new migration (pass name via CLI_ARGS, e.g. task db:migration -- "add users table")
+    cmd: docker compose exec backend alembic revision --autogenerate -m "{{.CLI_ARGS}}"
+
+  db:downgrade:
+    desc: Rollback one migration
+    cmd: docker compose exec backend alembic downgrade -1
+
+  db:psql:
+    desc: Open psql shell
+    interactive: true
+    cmd: docker compose exec db psql -U chorus chorus
+
+  backend:shell:
+    desc: Shell into backend container
+    interactive: true
+    cmd: docker compose exec backend bash
+
+  backend:test:
+    desc: Run backend tests
+    cmd: docker compose exec backend pytest {{.CLI_ARGS}}
+
+  backend:lint:
+    desc: Lint backend code
+    cmd: docker compose exec backend ruff check .
+
+  backend:format:
+    desc: Format backend code
+    cmd: docker compose exec backend ruff format .
+
+  frontend:shell:
+    desc: Shell into frontend container
+    interactive: true
+    cmd: docker compose exec frontend bash
+
+  frontend:test:
+    desc: Run frontend tests
+    cmd: docker compose exec frontend npm test
+
+  frontend:lint:
+    desc: Lint frontend code
+    cmd: docker compose exec frontend npm run lint
