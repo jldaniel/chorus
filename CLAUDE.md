@@ -7,7 +7,7 @@ Project management for humans and AI.
 | Layer    | Technologies                          |
 |----------|---------------------------------------|
 | Frontend | React 19, Vite 7, Tailwind CSS v4    |
-| Backend  | Python, FastAPI, SQLAlchemy 2, Alembic|
+| Backend  | Python, FastAPI, SQLAlchemy 2, Alembic, uv |
 | Database | PostgreSQL 17                         |
 | Tooling  | Docker Compose, Task (taskfile.dev)   |
 | Linting  | Ruff (backend), ESLint (frontend)     |

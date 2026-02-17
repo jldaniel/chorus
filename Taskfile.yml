@@ -30,6 +30,10 @@ tasks:
     interactive: true
     cmd: docker compose exec db psql -U chorus chorus
 
+  backend:lock:
+    desc: Regenerate backend uv.lock (runs in ephemeral container)
+    cmd: docker run --rm -v ./backend:/app -w /app ghcr.io/astral-sh/uv:python3.13-bookworm uv lock
+
   backend:shell:
     desc: Shell into backend container
     interactive: true
