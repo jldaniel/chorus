@@ -14,6 +14,7 @@ services:
       retries: 5
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./docker/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql
 
   backend:
     build: ./backend
@@ -30,7 +31,7 @@ services:
 
   frontend:
     build: ./frontend
-    command: npm run dev -- --host
+    command: yarn dev --host
     ports:
       - "3000:5173"
     volumes:
