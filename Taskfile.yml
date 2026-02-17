@@ -58,8 +58,8 @@ tasks:
 
   frontend:test:
     desc: Run frontend tests
-    cmd: docker compose exec frontend npm test
+    cmd: docker compose exec frontend yarn test
 
   frontend:lint:
     desc: Lint frontend code
-    cmd: docker compose exec frontend npm run lint
+    cmd: docker compose exec frontend yarn lint

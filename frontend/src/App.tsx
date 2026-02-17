@@ -1,43 +1,23 @@
-import { useEffect, useState } from "react";
+import { Routes, Route, Navigate } from "react-router-dom";
+import Layout from "./components/Layout";
+import ProjectList from "./views/ProjectList";
+import ProjectLayout from "./views/ProjectLayout";
+import TaskTreeView from "./views/TaskTreeView";
+import KanbanBoard from "./views/KanbanBoard";
+import LockMonitor from "./views/LockMonitor";
 
-function App() {
-  const [status, setStatus] = useState<string | null>(null);
-
-  useEffect(() => {
-    fetch("/api/health")
-      .then((res) => res.json())
-      .then((data) => setStatus(data.status))
-      .catch(() => setStatus("error"));
-  }, []);
-
-  const isOk = status === "ok";
-
+export default function App() {
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center bg-gray-950 text-white">
-      <h1 className="text-5xl font-bold tracking-tight">Chorus</h1>
-      <p className="mt-3 text-lg text-gray-400">
-        Project management for humans and AI
-      </p>
-      <div className="mt-6 flex items-center gap-2 text-sm">
-        <span
-          className={`inline-block h-2.5 w-2.5 rounded-full ${
-            status === null
-              ? "bg-gray-500"
-              : isOk
-                ? "bg-green-500"
-                : "bg-red-500"
-          }`}
-        />
-        <span className="text-gray-400">
-          {status === null
-            ? "Checking backend..."
-            : isOk
-              ? "Backend: ok"
-              : "Backend: unreachable"}
-        </span>
-      </div>
-    </div>
+    <Routes>
+      <Route element={<Layout />}>
+        <Route index element={<ProjectList />} />
+        <Route path="projects/:projectId" element={<ProjectLayout />}>
+          <Route index element={<Navigate to="tree" replace />} />
+          <Route path="tree" element={<TaskTreeView />} />
+          <Route path="kanban" element={<KanbanBoard />} />
+          <Route path="locks" element={<LockMonitor />} />
+        </Route>
+      </Route>
+    </Routes>
   );
 }
-
-export default App;

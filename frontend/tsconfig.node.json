@@ -1,10 +1,12 @@
 {
   "compilerOptions": {
-    "target": "ES2025",
+    "target": "ES2024",
+    "composite": true,
     "module": "ESNext",
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
-    "noEmit": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
     "strict": true,
     "skipLibCheck": true
   },
