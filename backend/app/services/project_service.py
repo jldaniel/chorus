@@ -82,7 +82,7 @@ async def get_project_tasks(
     result = await session.execute(
         select(Task)
         .where(Task.project_id == project_id, Task.parent_task_id.is_(None))
-        .options(selectinload(Task.children), selectinload(Task.lock))
+        .options(selectinload(Task.children, recursion_depth=-1), selectinload(Task.lock))
         .order_by(Task.position)
     )
     return list(result.scalars().all())

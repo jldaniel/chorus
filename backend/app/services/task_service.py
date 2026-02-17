@@ -87,7 +87,7 @@ def enrich_task(task: Task) -> dict:
 
 def _task_load_options():
     return [
-        selectinload(Task.children).selectinload(Task.children),
+        selectinload(Task.children, recursion_depth=-1),
         selectinload(Task.lock),
     ]
 
@@ -231,14 +231,11 @@ async def get_task_context(
 ) -> dict:
     """Fetch task + ancestry + work log (+ commits). Compute freshness."""
     # Load task with all relationships needed (deep children for enrich_task)
-    children_chain = selectinload(Task.children)
-    for _ in range(5):
-        children_chain = children_chain.selectinload(Task.children)
     result = await session.execute(
         select(Task)
         .where(Task.id == task_id)
         .options(
-            children_chain,
+            selectinload(Task.children, recursion_depth=-1),
             selectinload(Task.lock),
             selectinload(Task.work_log_entries),
             selectinload(Task.commits),
@@ -349,10 +346,7 @@ async def update_task_status(
         select(Task)
         .where(Task.id == task_id)
         .options(
-            selectinload(Task.children)
-            .selectinload(Task.children)
-            .selectinload(Task.children)
-            .selectinload(Task.children),
+            selectinload(Task.children, recursion_depth=-1),
             selectinload(Task.lock),
         )
     )
