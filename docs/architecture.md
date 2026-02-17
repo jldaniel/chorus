@@ -6,22 +6,21 @@
 
 - [Executive Summary](#executive-summary)
 - [Core Concepts](#core-concepts)
-- [Autonomy Mode](#autonomy-mode)
 - [Complexity Scoring Framework](#complexity-scoring-framework)
 - [Agent Interaction Model](#agent-interaction-model)
 - [Task Lifecycle](#task-lifecycle)
 - [Data Model](#data-model)
 - [System Architecture](#system-architecture)
+- [Deployment Trust Model](#deployment-trust-model)
 - [API Design](#api-design)
 - [Agent Skill Design](#agent-skill-design)
+- [Non-Functional Requirements](#non-functional-requirements)
 - [Frontend Design](#frontend-design)
 - [Project Structure](#project-structure)
-- [Implementation Plan](#implementation-plan)
-- [Key Design Decisions](#key-design-decisions)
 
 ## Executive Summary
 
-Chorus is a project management system intended for working with AI agents on more complicated tasks. The project focuse letting agents help break down and define tasks to then work on those tasks when sufficiently defined. The system provides hierarchical task management with infinite nesting, a complexity scoring framework, basic locking for multi-agent concurrency. An autonomy mode system controls whether agents can freely operate on projects and tasks or whether human review gates are enforced. Tasks flow through a pipeline of atomic operations — sizing, breakdown, refinement, review, and implementation — each performed by a single agent in a single session.
+Chorus is a project management system intended for working with AI agents on more complicated tasks. The project focuses on letting agents help break down and define tasks to then work on those tasks when sufficiently defined. The system provides hierarchical task management with infinite nesting, a complexity scoring framework, and basic locking for multi-agent concurrency. Tasks flow through a pipeline of atomic operations — sizing, breakdown, refinement, and implementation — each performed by a single agent in a single session.
 
 Chorus exposes a REST API backed by PostgreSQL, agent skill files that teach coding agents like Claude Code and Cursor how to interact with the system, and a React frontend for human oversight and project management.
 
@@ -50,63 +49,48 @@ Tasks have a simple four-state lifecycle. Status tracks execution state only —
 | Status | Meaning |
 |---|---|
 | To Do | Task exists but work has not started |
-| Doing | An agent is actively working on implementation |
+| Doing | An agent is actively working on an operation (sizing, breakdown, refinement, or implementation) |
 | Done | Implementation is complete |
 | Won't Do | Task has been cancelled or determined unnecessary |
 
 ### Task Readiness
 
-The system computes readiness using the following logic, evaluated in priority order. The "Pending Review" state only applies to tasks in `manual` mode — in `agent` mode, the review gate is skipped.
+The system computes readiness from task data using deterministic rules. This is evaluated in order:
+
+1. If `needs_refinement = true`: **Needs Refinement**
+2. Else if `points` is null: **Needs Sizing**
+3. Else if task has children and `unsized_children > 0`: **Needs Breakdown** (breakdown in progress)
+4. Else if `effective_points > 6`: **Needs Breakdown**
+5. Else if task has children: **Blocked by Children** (parent is coordination-only, not directly implementable)
+6. Else: **Ready**
+
+Computed states:
 
 | Computed State | Condition | What It Means |
 |---|---|---|
-| Needs Refinement | `needs_refinement` flag is true | A human or agent has flagged the task as insufficiently defined. The `refinement_notes` field explains what is missing. |
-| Needs Sizing | `points` is null | The task has not been assessed for complexity. An agent should take it for sizing. |
-| Needs Breakdown | `points` > 6 and no sized children exist | The task has been sized and is too complex for a single agent session. It needs decomposition into subtasks. |
-| Pending Review | `approved` is false AND effective autonomy mode is `manual` | The task appears technically ready but has not been reviewed by a human. Only applies in `manual` mode. |
-| Ready | All above conditions are false | The task is fully defined, appropriately sized, and (if in manual mode) approved. An agent can take it for implementation. |
+| Needs Refinement | `needs_refinement` is true | Task definition is insufficient. `refinement_notes` explains what is missing. |
+| Needs Sizing | `points` is null | Task has not been assessed for complexity. |
+| Needs Breakdown | `effective_points > 6`, or children exist but are not fully sized | Task is too complex or decomposition is incomplete. |
+| Blocked by Children | Children exist and `effective_points <= 6` | Parent is not directly implementable; execute leaf tasks. |
+| Ready | Leaf task with `effective_points <= 6` and no higher-priority blockers | Task is implementation-ready. |
 
-The `needs_refinement` boolean is the only readiness-related flag stored on the task. It exists because refinement is a judgment call that cannot be inferred from other data. When a human or agent determines that a task description is ambiguous, incomplete, or contradictory, they set this flag and provide `refinement_notes` explaining what needs to change.
+There is no `needs_breakdown` field. Breakdown eligibility is purely computed from sizing and child completeness data.
+
+The `needs_refinement` boolean is the only stored readiness flag because refinement is a judgment call that cannot be inferred from structure alone.
 
 ### Projects
 
-Projects are organizational containers for tasks. Each project has a name and description that provides high-level context about the project's goals, constraints, and architecture. Top-level tasks belong to a project, and all descendants inherit that project association through the hierarchy. Each project also has an autonomy mode that serves as the default for all tasks within it (see [Autonomy Mode](#autonomy-mode)).
+Projects are organizational containers for tasks. Each project has a name and description that provides high-level context about the project's goals, constraints, and architecture. Top-level tasks belong to a project, and all descendants inherit that project association through the hierarchy.
 
-## Autonomy Mode
+### Parent-Child Execution Rules
 
-Chorus supports two modes of operation that control whether AI agents can interact with a project or task. This is enforced at the API layer, not just advisory.
+Once a task has children, it becomes a coordination node and is not directly implementable. Implementation is leaf-only.
 
-### Modes
+Parent status is still explicit (not auto-derived by a background job), but transitions are constrained:
 
-| Mode | Behavior |
-|---|---|
-| `agent` | Agents operate freely — they can size, break down, refine, and implement tasks without human review gates. The `approved` flag and "Pending Review" computed state are skipped; tasks go directly from sized to ready. |
-| `manual` | Agents are blocked from operating on the task. All mutation endpoints (lock acquisition, sizing, breakdown, status changes) return 403 for non-human agent types. Humans retain full control over task definition, review, and implementation. |
-
-### Inheritance
-
-Autonomy mode is set on **projects** as the default for all tasks. Individual **tasks** can override the project default, and that override flows down to all descendants.
-
-The resolution order for a task's effective autonomy mode:
-
-1. If the task has an explicit `autonomy_mode_override`, use it.
-2. Otherwise, walk up the parent chain until a task with an explicit override is found.
-3. If no ancestor has an override, use the project's `autonomy_mode`.
-
-The API computes and returns `effective_autonomy_mode` on every task response. This allows a human to set a project to `manual` but release a specific subtree to agents by overriding a single task to `agent` — all children inherit that override.
-
-### API Enforcement
-
-Enforcement happens at the API layer using the requesting agent's identity. Every agent session registers in the system with a `session_id` and `agent_type` (e.g., `claude_code`, `cursor`, `human`). When a mutation endpoint receives a request for a task whose effective mode is `manual`:
-
-- If the requester's `agent_type` is non-human: the API returns **403 Forbidden** with a message explaining the task is in manual mode.
-- If the requester's `agent_type` is `human`: the request proceeds normally.
-
-This applies to all mutation endpoints: lock acquisition, sizing, breakdown, refinement, status changes, subtask creation, and approval.
-
-Discovery endpoints (`/tasks/available`) filter out `manual`-mode tasks by default when queried by a non-human agent, so agents never see work they cannot act on.
-
-The skill file reinforces this by teaching agents to only look for `agent`-mode work, but even if an agent ignores that guidance, the API blocks it.
+- Parent can move to `done` only when all descendants are in terminal states (`done` or `wont_do`) and at least one descendant is `done`.
+- Parent should move to `doing` only for parent-scoped operations (for example refinement or breakdown), not coding implementation.
+- If any child is reopened from `done` to `todo/doing`, the parent must be reopened to `todo`.
 
 ## Complexity Scoring Framework
 
@@ -128,7 +112,7 @@ Each dimension is scored 0–2, for a maximum total of 10 points. The dimensions
 
 | Condition | Action |
 |---|---|
-| Total <= 6 | Task is appropriately sized for agent execution. Mark as sized and move through review. |
+| Total <= 6 | Task is appropriately sized for agent execution. Mark as sized and move to ready. |
 | Total >= 7 | Task is too complex. Must be broken down into subtasks before implementation. |
 | Confidence <= 2 | Sizing agent is uncertain about its assessment. Flag for human review or further refinement before proceeding. |
 
@@ -182,7 +166,7 @@ Every interaction an agent has with a task is an atomic operation: a single, sel
 
 ### Task Locking
 
-Chorus uses pessimistic locking to ensure only one agent operates on a task at a time. When an agent takes a task, it acquires an exclusive lock specifying the operation purpose. Other agents see the task as locked and skip it. Locks have a TTL-based expiration time to prevent zombie locks from crashed or abandoned agent sessions. The TTL is set automatically based on the lock purpose — no heartbeat or background process is required.
+Chorus uses pessimistic locking to ensure only one agent operates on a task at a time. When an agent takes a task, it acquires an exclusive lock specifying the operation purpose and a `caller_label` identifying who is holding the lock. Other agents see the task as locked and skip it. Locks have a TTL-based expiration computed from `MAX(acquired_at, last_heartbeat_at) + TTL`. The TTL is set automatically based on the lock purpose.
 
 TTL per lock purpose:
 
@@ -193,13 +177,15 @@ TTL per lock purpose:
 | refinement | 30 minutes |
 | implementation | 1 hour |
 
-When a lock is acquired, the server computes `expires_at` from the purpose-based TTL. If an existing lock has expired at the time a new acquisition is attempted, the server releases the stale lock and grants the new request. A background cleanup task also periodically sweeps expired locks. Humans (project owners) can force-release any lock via `DELETE /tasks/{id}/lock`, even locks they don't hold.
+When a lock is acquired, the server computes `expires_at` from the purpose-based TTL. If an existing lock has expired at the time a new acquisition is attempted, the server releases the stale lock and grants the new request. A background cleanup task also periodically sweeps expired locks. Anyone can force-release any lock via `DELETE /tasks/{id}/lock?force=true`.
+
+For long-running operations, lock holders can send heartbeats via `PATCH /tasks/{id}/lock/heartbeat` to extend the lock. Each heartbeat resets `last_heartbeat_at` and recomputes `expires_at` from that timestamp plus the purpose-based TTL.
 
 The locking protocol:
 
 | Step | Action | Details |
 |---|---|---|
-| 1 | Acquire | Agent requests a lock with a purpose (sizing, breakdown, refinement, implementation). The server validates that the task is in an appropriate state for the requested operation and that no unexpired lock is held. If an expired lock exists, it is released automatically. |
+| 1 | Acquire | Agent requests a lock with a purpose (sizing, breakdown, refinement, implementation) and a `caller_label`. The server validates that the task is in an appropriate state for the requested operation and that no unexpired lock is held. If an expired lock exists, it is released automatically. |
 | 2 | Operate | Agent performs its atomic operation. The lock purpose constrains what operations are valid. |
 | 3 | Log | Agent writes a work log entry describing what it did, decisions it made, and any issues encountered. |
 | 4 | Release | Agent explicitly releases the lock. If the agent crashes, the TTL expiry handles cleanup. |
@@ -208,25 +194,39 @@ Lock validation rules enforced by the API:
 
 | Lock Purpose | Precondition |
 |---|---|
-| (all) | If the task's effective autonomy mode is `manual`, the requesting agent must have `agent_type` of `human`. Non-human agents receive 403. |
 | sizing | Task must not already be sized (`points` is null) |
-| breakdown | Task must be sized with total > 6 or flagged for breakdown |
+| breakdown | Task must be sized and either `effective_points > 6` or have children with `unsized_children > 0` |
 | refinement | No specific precondition — any task can be refined |
-| implementation | Task must be in ready computed state |
+| implementation | Task must be in computed `Ready` state (leaf-only, no blockers) |
 
 ### Work Logs
 
 Work logs are the continuity mechanism between agents. Since each operation is atomic and agents have no memory between sessions, the work log provides the full history of what has been done to a task. Every atomic operation must leave a work log entry. When a new agent picks up a task, it reads the description (the spec), the sizing breakdown (the complexity assessment), and the work log (the operational history) to get complete context.
 
-Work log entries are immutable and append-only. Each entry records the agent, the operation type, a timestamp, and freeform content describing what was done.
+Work log entries are immutable and append-only. Each entry records the author, the operation type, a timestamp, and freeform content describing what was done.
+
+Every operation log entry should include:
+
+- Decision made
+- Changes applied
+- Blockers or risks
+- Next handoff note
 
 ### Commit Tracking
 
-Commits are tracked as metadata on tasks, decoupled from task status. An agent can work on a task, make several commits, and release the lock without completing the task. The next agent sees the commit history and can pick up where the previous agent left off. Each commit records the hash, message, the agent that made it, and a timestamp.
+Commits are tracked as metadata on tasks, decoupled from task status. An agent can work on a task, make several commits, and release the lock without completing the task. The next agent sees the commit history and can pick up where the previous agent left off. Each commit records the hash, message, the author that made it, and a timestamp.
 
 ### Context Traversal
 
-Agents need to understand how their task fits into the broader project. The API provides endpoints for traversing the task hierarchy: ancestry (the chain from a task up to the project root) and tree (a task and all its descendants). A dedicated context endpoint synthesizes the full picture — the task's description, all ancestor descriptions, the work log, and commit history — into a single response optimized for an LLM's context window.
+Agents need to understand how their task fits into the broader project. The API provides endpoints for traversing the task hierarchy: ancestry (the chain from a task up to the project root) and tree (a task and all its descendants). A dedicated context endpoint synthesizes the full picture — the task's description, all ancestor descriptions, and the work log — into a single response optimized for an LLM's context window. An optional `?include_commits=true` parameter adds commit history to the response.
+
+The context endpoint also returns freshness metadata:
+
+- `context_captured_at`: when this task's context field was last authored or confirmed
+- `context_freshness`: `fresh` or `stale`
+- `stale_reasons`: list of ancestor tasks updated after `context_captured_at`
+
+Freshness is evaluated at read time. Stale context is warning-level in v1 (does not block lock acquisition), but agents should log when proceeding with stale context.
 
 ### Parent-Child Consistency
 
@@ -234,7 +234,7 @@ When breaking down tasks, agents may arrive at conclusions that diverge from the
 
 ## Task Lifecycle
 
-A task moves through a pipeline of atomic operations, with review gates between each step. The pipeline is not a rigid state machine — tasks can be refined at any point, sizing can be revised, and the review gate is optional for trusted workflows.
+A task moves through a pipeline of atomic operations. The pipeline is not a rigid state machine — tasks can be refined at any point and sizing can be revised.
 
 ### Standard Flow
 
@@ -244,19 +244,18 @@ The typical lifecycle of a task from creation to completion:
 |---|---|---|
 | 1. Creation | Human / PM Agent | A task is created with a name and description. May include a gut-feel size estimate. The task enters the system as To Do with computed readiness of Needs Sizing (if unsized) or Needs Breakdown (if sized > 6). |
 | 2. Sizing | Sizing Agent | Agent locks the task for sizing. Reads the description. Scores each of the five complexity dimensions with reasoning. If total <= 6, the task is marked as sized. If total >= 7, it is flagged for breakdown. Agent releases the lock. |
-| 3. Review | Human / PM Agent | **Manual mode only.** Reviews the sizing assessment. Checks that the description is clear, the scoring is reasonable, and the task is well-defined. Approves the task or flags it for refinement with notes. In `agent` mode, this step is skipped — tasks move directly from sizing to breakdown or implementation. |
-| 4. Breakdown | Breakdown Agent | For tasks scoring >= 7: agent locks the parent, creates subtasks with descriptions and context, optionally updates the parent description, logs decisions. Each subtask starts the pipeline from the beginning. |
-| 5. Implementation | Implementation Agent | Agent locks a ready task for implementation. Reads the description, context, sizing, and work log. Performs the coding work. Makes commits (tracked as metadata). Marks the task Done. Releases the lock. |
+| 3. Breakdown | Breakdown Agent | For tasks scoring >= 7: agent locks the parent, creates subtasks with descriptions and context, optionally updates the parent description, logs decisions. Each subtask starts the pipeline from the beginning. |
+| 4. Implementation | Implementation Agent | Agent locks a ready leaf task for implementation. Reads the description, context, sizing, and work log. Performs the coding work. Makes commits (tracked as metadata). Completes task via atomic completion endpoint that writes work log and marks Done together. Releases the lock. |
 
 ### Flexible Workflows
 
-The pipeline is not strictly linear. A task can be refined at any point — before or after sizing. A human can provide an initial gut-feel size, have the task refined for better definition, and then have it re-sized with more accurate scoring. Sizing can be revised if new information emerges. The approval gate can be skipped for low-risk tasks or high-trust agent teams. What matters is that the data on the task accurately reflects its current state, and the computed readiness derives the correct next action from that data.
+The pipeline is not strictly linear. A task can be refined at any point — before or after sizing. A human can provide an initial gut-feel size, have the task refined for better definition, and then have it re-sized with more accurate scoring. Sizing can be revised if new information emerges. What matters is that the data on the task accurately reflects its current state, and the computed readiness derives the correct next action from that data.
 
 ## Data Model
 
 ### Entity Relationship Overview
 
-The data model consists of six entities. Projects contain Tasks in a hierarchy. Tasks are operated on by Agents via Locks. Work done on tasks is recorded in WorkLogEntries and TaskCommits.
+The data model consists of five entities. Projects contain Tasks in a hierarchy. Tasks are operated on via Locks. Work done on tasks is recorded in WorkLogEntries and TaskCommits.
 
 ### Projects
 
@@ -265,7 +264,6 @@ The data model consists of six entities. Projects contain Tasks in a hierarchy. 
 | id | UUID | PK | Unique identifier |
 | name | VARCHAR(255) | NOT NULL | Project name |
 | description | TEXT | NULLABLE | Project goals, architecture, constraints |
-| autonomy_mode | ENUM | NOT NULL, DEFAULT manual | Default autonomy mode for all tasks: agent, manual |
 | created_at | TIMESTAMP | NOT NULL, DEFAULT NOW | Creation timestamp |
 | updated_at | TIMESTAMP | NOT NULL, DEFAULT NOW | Last modification timestamp |
 
@@ -286,8 +284,7 @@ The data model consists of six entities. Projects contain Tasks in a hierarchy. 
 | sizing_confidence | INTEGER | NULLABLE | Agent confidence in sizing (0-5) |
 | needs_refinement | BOOLEAN | NOT NULL, DEFAULT FALSE | Flag for insufficient definition |
 | refinement_notes | TEXT | NULLABLE | Explanation of what needs refinement |
-| approved | BOOLEAN | NOT NULL, DEFAULT FALSE | Human/PM has reviewed and approved |
-| autonomy_mode_override | ENUM | NULLABLE | Override autonomy mode for this subtree: agent, manual. Null = inherit from parent or project. |
+| context_captured_at | TIMESTAMP | NULLABLE | When `context` was last authored or explicitly confirmed |
 | position | INTEGER | NOT NULL, DEFAULT 0 | Ordering among siblings |
 | created_at | TIMESTAMP | NOT NULL, DEFAULT NOW | Creation timestamp |
 | updated_at | TIMESTAMP | NOT NULL, DEFAULT NOW | Last modification timestamp |
@@ -298,10 +295,11 @@ The data model consists of six entities. Projects contain Tasks in a hierarchy. 
 |---|---|---|---|
 | id | UUID | PK | Unique identifier |
 | task_id | UUID | FK -> Tasks, UNIQUE | One lock per task |
-| agent_id | UUID | FK -> Agents, NOT NULL | Agent session holding the lock |
+| caller_label | VARCHAR(255) | NOT NULL | Freeform label identifying who holds the lock |
 | lock_purpose | ENUM | NOT NULL | sizing, breakdown, refinement, implementation |
 | acquired_at | TIMESTAMP | NOT NULL, DEFAULT NOW | When the lock was acquired |
-| expires_at | TIMESTAMP | NOT NULL | Auto-release time (set from purpose-based TTL) |
+| last_heartbeat_at | TIMESTAMP | NULLABLE | Last heartbeat timestamp. Null if no heartbeat sent. |
+| expires_at | TIMESTAMP | NOT NULL | Auto-release time: MAX(acquired_at, last_heartbeat_at) + TTL |
 
 ### Task Commits
 
@@ -309,7 +307,7 @@ The data model consists of six entities. Projects contain Tasks in a hierarchy. 
 |---|---|---|---|
 | id | UUID | PK | Unique identifier |
 | task_id | UUID | FK -> Tasks, NOT NULL | Associated task |
-| agent_id | UUID | FK -> Agents, NULLABLE | Agent that made the commit |
+| author | VARCHAR(255) | NULLABLE | Who made the commit |
 | commit_hash | VARCHAR(40) | NOT NULL | Git commit SHA |
 | message | TEXT | NULLABLE | Commit message |
 | committed_at | TIMESTAMP | NOT NULL | When the commit was made |
@@ -320,19 +318,10 @@ The data model consists of six entities. Projects contain Tasks in a hierarchy. 
 |---|---|---|---|
 | id | UUID | PK | Unique identifier |
 | task_id | UUID | FK -> Tasks, NOT NULL | Associated task |
-| agent_id | UUID | FK -> Agents, NULLABLE | Agent or null for human entries |
-| operation | ENUM | NOT NULL | sizing, breakdown, refinement, implementation, review, note |
+| author | VARCHAR(255) | NULLABLE | Who created the entry |
+| operation | ENUM | NOT NULL | sizing, breakdown, refinement, implementation, note |
 | content | TEXT | NOT NULL | What was done, decisions made, issues encountered |
 | created_at | TIMESTAMP | NOT NULL, DEFAULT NOW | Entry timestamp |
-
-### Agents
-
-| Column | Type | Constraints | Description |
-|---|---|---|---|
-| id | UUID | PK | Unique identifier |
-| session_id | VARCHAR | NOT NULL, UNIQUE | The agent's session identifier (e.g. Claude Code session ID) |
-| agent_type | VARCHAR(100) | NOT NULL | e.g. claude_code, cursor, human |
-| created_at | TIMESTAMP | NOT NULL, DEFAULT NOW | Registration timestamp |
 
 ### Key Indexes
 
@@ -343,10 +332,20 @@ The data model consists of six entities. Projects contain Tasks in a hierarchy. 
 | idx_tasks_status | Tasks | status | Filter by execution state |
 | idx_tasks_points | Tasks | points | Find unsized or oversized tasks |
 | idx_locks_task | TaskLocks | task_id (UNIQUE) | Lock lookup and enforcement |
-| idx_locks_agent | TaskLocks | agent_id | Find all locks held by an agent |
 | idx_locks_expiry | TaskLocks | expires_at | Cleanup expired locks |
 | idx_commits_task | TaskCommits | task_id | Find commits for a task |
 | idx_worklog_task | WorkLogEntries | task_id, created_at | Chronological work history |
+
+### Data Integrity Constraints
+
+Invariants are enforced in both the database and service layer:
+
+- Parent/child must share `project_id` (enforced on create/update).
+- Cycles in the task tree are disallowed (validated before parent change).
+- `points` must be between 0 and 10.
+- `sizing_confidence` must be between 0 and 5.
+- Sibling ordering uses unique `(parent_task_id, position)` to keep deterministic ordering.
+- Timestamps are stored in UTC and serialized as ISO-8601.
 
 ## System Architecture
 
@@ -367,11 +366,27 @@ The system is composed of three runtime components and a set of static skill fil
 
 **PostgreSQL Database** — The source of truth for all project and task data. Handles concurrent access through database-level locking (SELECT FOR UPDATE) and ACID transactions. All computed properties (effective points, readiness, ancestry) are derived at query time via SQL.
 
-**FastAPI Backend** — The REST API service. Handles all CRUD operations, enforces business rules (lock validation, state transitions, sizing validation, autonomy mode enforcement), computes derived fields for API responses, and manages the lock lifecycle including expiry cleanup. Organized into routes (HTTP layer), services (business logic), and models (data layer).
+**FastAPI Backend** — The REST API service. Handles all CRUD operations, enforces business rules (lock validation, state transitions, sizing validation), computes derived fields for API responses, and manages the lock lifecycle including expiry cleanup. Organized into routes (HTTP layer), services (business logic), and models (data layer).
 
-**React Frontend** — The human interface. Provides a tree view of the task hierarchy, a task detail panel with sizing breakdown visualization, a review queue for pending tasks, and a kanban-style board for tracking execution status. Communicates exclusively through the REST API.
+**React Frontend** — The human interface. Provides a tree view of the task hierarchy, a task detail panel with sizing breakdown visualization, and a kanban-style board for tracking execution status. Communicates exclusively through the REST API.
 
 **Agent Skill Files** — Markdown documentation that teaches coding agents how to interact with Chorus. Agents read the skill file to learn API endpoints, workflow patterns, and the sizing rubric, then make HTTP calls directly against the REST API. No intermediary process is needed — the skill file is the agent interface.
+
+## Deployment Trust Model
+
+Chorus v1 intentionally runs without authentication and authorization. It is designed for trusted, single-tenant homelab use and private network access.
+
+Guardrails for this model:
+
+- Do not expose the API directly to the public internet.
+- Treat `caller_label` and `author` fields as coordination metadata, not identity proof.
+- `force=true` lock release remains available for operator recovery.
+- Heartbeat/release still require matching `caller_label` for normal flows, with `force=true` as a manual override.
+
+Recommended deployment boundary:
+
+- Private LAN only, or VPN-only access (for example Tailscale/WireGuard).
+- Optional reverse proxy IP allowlist if external access is needed.
 
 ## API Design
 
@@ -383,7 +398,8 @@ The system is composed of three runtime components and a set of static skill fil
 | GET | /projects | List all projects |
 | GET | /projects/{id} | Get project details with summary statistics |
 | PUT | /projects/{id} | Update project name or description |
-| DELETE | /projects/{id} | Delete a project and all associated tasks |
+| GET | /projects/{id}/export | Export full project snapshot (tasks, work logs, commits) for backup/audit |
+| DELETE | /projects/{id} | Hard delete project and all associated tasks. Caller should export first if retention is needed. |
 | GET | /projects/{id}/tasks | Get top-level tasks for a project |
 
 ### Task Endpoints
@@ -394,57 +410,93 @@ The system is composed of three runtime components and a set of static skill fil
 | POST | /tasks/{id}/subtasks | Create a subtask under a parent |
 | GET | /tasks/{id} | Get task with computed fields (effective points, readiness, children summary) |
 | PUT | /tasks/{id} | Update task fields (name, description, context, type) |
-| DELETE | /tasks/{id} | Delete a task and all descendants |
+| DELETE | /tasks/{id} | Hard delete task and descendants. Prefer parent-level archival/export before destructive deletes. |
 | GET | /tasks/{id}/tree | Get full subtree recursively |
 | GET | /tasks/{id}/ancestry | Get chain from task to project root |
-| GET | /tasks/{id}/context | Synthesized context: description + ancestor descriptions + work log |
+| GET | /tasks/{id}/context | Synthesized context + freshness metadata. Optional `?include_commits=true` adds commit history. |
 | PATCH | /tasks/{id}/status | State transition with validation |
 | PATCH | /tasks/{id}/reorder | Change position among siblings |
+
+Deletion and retention policy for v1:
+
+- Deletion is hard-delete by default for simplicity.
+- Deleting a project removes all descendant tasks, work logs, and commit records.
+- If retention is needed, callers should use export endpoints before deletion.
+- Soft-delete can be added in a future version if retention requirements grow.
 
 ### Atomic Operation Endpoints
 
 | Method | Path | Description |
 |---|---|---|
-| POST | /tasks/{id}/size | Submit five-dimension scoring. Server validates and computes total. |
-| POST | /tasks/{id}/breakdown | Create subtasks from a breakdown. Accepts subtask array and optional parent description update. Requires work log entry. |
-| POST | /tasks/{id}/refine | Update description/context for refinement. Clears `needs_refinement` flag. |
-| POST | /tasks/{id}/approve | Mark task as reviewed and approved by human/PM. |
+| POST | /tasks/{id}/size | Submit five-dimension scoring. Server validates and computes total. Requires `work_log_content` — the server creates the work log entry transactionally with the sizing. |
+| POST | /tasks/{id}/breakdown | Create subtasks from a breakdown. Accepts subtask array and optional parent description update. Requires `work_log_content` — the server creates the work log entry transactionally with the breakdown. |
+| POST | /tasks/{id}/refine | Update description/context for refinement. Clears `needs_refinement` flag. Requires `work_log_content` and writes log transactionally. |
 | POST | /tasks/{id}/flag-refinement | Set `needs_refinement` with notes explaining what is missing. |
+| POST | /tasks/{id}/complete | Complete implementation atomically: append implementation work log, attach optional commits, and set status to `done` in one transaction. |
 
 ### Lock Endpoints
 
 | Method | Path | Description |
 |---|---|---|
-| POST | /tasks/{id}/lock | Acquire lock (agent_id, purpose). Validates preconditions. Sets expires_at from purpose-based TTL. |
-| DELETE | /tasks/{id}/lock | Release lock. Agent must be the lock holder, or requester must be a project owner (force-release). |
+| POST | /tasks/{id}/lock | Acquire lock (caller_label, purpose). Validates preconditions. Sets expires_at from purpose-based TTL. |
+| PATCH | /tasks/{id}/lock/heartbeat | Extend lock expiry. Resets `last_heartbeat_at` and recomputes `expires_at`. Caller must be the lock holder. |
+| DELETE | /tasks/{id}/lock | Release lock. Caller must be the lock holder, or pass `?force=true` to force-release any lock. |
 
 ### Work Log and Commit Endpoints
 
 | Method | Path | Description |
 |---|---|---|
-| POST | /tasks/{id}/work-log | Append a work log entry (agent_id, operation, content) |
+| POST | /tasks/{id}/work-log | Append a work log entry (author, operation, content) |
 | GET | /tasks/{id}/work-log | Get chronological work log for a task |
-| POST | /tasks/{id}/commits | Record a commit (hash, message, agent_id) |
+| POST | /tasks/{id}/commits | Record a commit (hash, message, author) |
 | GET | /tasks/{id}/commits | Get all commits for a task |
 
 ### Discovery and Queue Endpoints
 
 | Method | Path | Description |
 |---|---|---|
-| GET | /projects/{id}/review-queue | Tasks in sized or needs_breakdown state pending review |
 | GET | /projects/{id}/backlog | Tasks in ready + todo state (implementation backlog) |
 | GET | /projects/{id}/in-progress | Tasks in doing state with lock information |
 | GET | /projects/{id}/needs-refinement | Tasks with low confidence or needs_refinement flag |
-| GET | /tasks/available | Unlocked tasks available for work, filterable by project, operation type, task type, and point range. Filters by effective autonomy mode based on the requesting agent's type — non-human agents only see `agent`-mode tasks. |
+| GET | /tasks/available | Unlocked tasks available for work, filterable by project, operation type, task type, and point range. |
 
-### Agent Endpoints
+Queue semantics for deterministic multi-agent behavior:
 
-| Method | Path | Description |
-|---|---|---|
-| POST | /agents | Register a new agent session (session_id, agent_type). Returns agent id for subsequent requests. |
-| GET | /agents | List all agent sessions |
-| GET | /agents/{id} | Get agent session details |
-| GET | /agents/{id}/tasks | Get tasks currently locked by this agent session |
+- All queue-style endpoints support `limit`, `offset`, and `sort` query parameters.
+- Default ordering for available work: `priority DESC`, `effective_points ASC`, `created_at ASC`, `id ASC`.
+- `/tasks/available` returns eligibility-filtered tasks only:
+  - `operation=sizing`: unsized tasks
+  - `operation=breakdown`: tasks in computed `Needs Breakdown`
+  - `operation=implementation`: tasks in computed `Ready`
+- Final claim is lock-based: clients must still acquire lock; `409` indicates race/loss.
+
+### API Error Contract
+
+All error responses share a common shape:
+
+```json
+{
+  "error": {
+    "code": "LOCK_CONFLICT",
+    "message": "Task is already locked by another caller",
+    "details": { "task_id": "..." },
+    "request_id": "..."
+  }
+}
+```
+
+Canonical HTTP statuses:
+
+- `400` malformed request
+- `401` reserved for future auth-enabled deployments
+- `403` reserved for future policy restrictions
+- `404` entity not found
+- `409` lock conflict or invalid concurrent update
+- `422` business rule violation (for example invalid state transition)
+- `429` rate limiting (optional, deployment-specific)
+- `500` unexpected server error
+
+Domain error codes include: `LOCK_CONFLICT`, `INVALID_READINESS_STATE`, `INVALID_STATUS_TRANSITION`, `CONTEXT_STALE`, `VALIDATION_ERROR`.
 
 ## Agent Skill Design
 
@@ -456,8 +508,8 @@ The skill file encodes everything an agent needs to operate:
 
 | Section | Content |
 |---|---|
-| Overview | What Chorus is, how autonomy mode works, what the agent should check before operating on any task |
-| API Reference | Base URL, authentication, key endpoints with request/response examples |
+| Overview | What Chorus is and how the task pipeline works |
+| API Reference | Base URL, key endpoints with request/response examples |
 | Sizing Rubric | The five-dimension scoring framework with scoring guidelines and examples |
 | Workflow Patterns | Step-by-step procedures for each atomic operation |
 | Conventions | Work log expectations, commit tracking, lock hygiene, scope discipline |
@@ -466,27 +518,47 @@ The skill file encodes everything an agent needs to operate:
 
 The skill file teaches agents these standard workflows:
 
-**Sizing workflow:** `GET /tasks/available?operation=sizing` -> `POST /tasks/{id}/lock` (purpose=sizing) -> `GET /tasks/{id}/context` -> `POST /tasks/{id}/size` -> `POST /tasks/{id}/work-log` -> `DELETE /tasks/{id}/lock`
+**Sizing workflow:** `GET /tasks/available?operation=sizing` -> `POST /tasks/{id}/lock` (purpose=sizing) -> `GET /tasks/{id}/context` -> `POST /tasks/{id}/size` (with `work_log_content`) -> `DELETE /tasks/{id}/lock`
 
-**Breakdown workflow:** `GET /tasks/available?operation=breakdown` -> `POST /tasks/{id}/lock` (purpose=breakdown) -> `GET /tasks/{id}/context` -> `POST /tasks/{id}/breakdown` -> `DELETE /tasks/{id}/lock`
+**Breakdown workflow:** `GET /tasks/available?operation=breakdown` -> `POST /tasks/{id}/lock` (purpose=breakdown) -> `GET /tasks/{id}/context` -> `POST /tasks/{id}/breakdown` (with `work_log_content`) -> `DELETE /tasks/{id}/lock`
 
-**Implementation workflow:** `GET /tasks/available?operation=implementation` -> `POST /tasks/{id}/lock` (purpose=implementation) -> `GET /tasks/{id}/context` -> [do coding work] -> `POST /tasks/{id}/commits` -> `PATCH /tasks/{id}/status` (done) -> `POST /tasks/{id}/work-log` -> `DELETE /tasks/{id}/lock`
+**Implementation workflow:** `GET /tasks/available?operation=implementation` -> `POST /tasks/{id}/lock` (purpose=implementation) -> `GET /tasks/{id}/context` -> [do coding work] -> `POST /tasks/{id}/complete` (work log + optional commits + done) -> `DELETE /tasks/{id}/lock`
 
 **Discovery workflow:** When an agent notices new work during implementation, it should create a new task linked to the current context rather than expanding scope. This keeps the current task atomic.
 
+Implementation completion should prefer `POST /tasks/{id}/complete` so status and operation log are written atomically.
+
+## Non-Functional Requirements
+
+Initial v1 targets for a homelab deployment:
+
+| Area | Target |
+|---|---|
+| Scale | Up to 50 projects, 100k tasks total, depth up to 12 levels |
+| Read latency | p95 < 300ms for single-task reads; p95 < 800ms for queue endpoints |
+| Write latency | p95 < 500ms for lock/sizing/refinement endpoints |
+| Lock cleanup | Expired lock sweep every 60 seconds; stale lock visible for no more than 2 minutes |
+| Context payload | Default context response capped at 64 KB serialized; endpoint supports truncation indicators |
+| Idempotency | `size`, `breakdown`, `refine`, and `complete` accept optional idempotency key header |
+
+Agent retry guidance:
+
+- On `409`, re-query available tasks and retry with exponential backoff.
+- On `422`, log failure reason to work log (if lock held) and release lock.
+- On `500`, retry with bounded backoff and jitter.
+
 ## Frontend Design
 
-The React frontend serves as the human oversight interface. While agents interact with the REST API directly (guided by skill files), humans use the frontend to create projects, review task quality, approve work, and monitor agent activity.
+The React frontend serves as the human oversight interface. While agents interact with the REST API directly (guided by skill files), humans use the frontend to create projects, manage tasks, and monitor agent activity.
 
 ### Key Views
 
 | View | Purpose | Key Interactions |
 |---|---|---|
 | Task Tree | Primary view. Hierarchical display of all tasks in a project with inline status, size, and computed readiness indicators. | Expand/collapse nodes, drag-and-drop reordering, click to open task detail panel, inline status badges |
-| Task Detail | Slide-out panel showing full task information when a task is selected. | Edit description/context, view sizing breakdown (radar chart), scroll work log timeline, view commits, approve/flag for refinement |
-| Review Queue | Filtered list of tasks awaiting human review, sorted by staleness. | Quick approve, flag for refinement with notes, view sizing details, bulk operations |
-| Kanban Board | Tasks organized by status columns (To Do, Doing, Done) within a project. | Visual status tracking, see which agents are working on what, identify bottlenecks |
-| Agent Activity | Dashboard showing active agents, their current locks, and recent work. | Monitor agent progress, identify stale locks, view agent work history |
+| Task Detail | Slide-out panel showing full task information when a task is selected. | Edit description/context, view sizing breakdown (radar chart), scroll work log timeline, view commits, flag for refinement |
+| Kanban Board | Tasks organized by status columns (To Do, Doing, Done, Won't Do) within a project. | Visual status tracking, see which agents are working on what, identify bottlenecks |
+| Lock Monitor | Dashboard showing active locks and recent work. | Monitor agent progress, identify stale locks, force-release expired locks |
 
 ### Technology Choices
 
@@ -509,7 +581,6 @@ chorus/
 │   │   ├── models/                     # SQLAlchemy ORM models
 │   │   │   ├── project.py
 │   │   │   ├── task.py
-│   │   │   ├── agent.py
 │   │   │   ├── lock.py
 │   │   │   ├── work_log.py
 │   │   │   └── commit.py
@@ -521,12 +592,11 @@ chorus/
 │   │   │   ├── routes/                 # HTTP route handlers
 │   │   │   │   ├── projects.py
 │   │   │   │   ├── tasks.py
-│   │   │   │   ├── agents.py
 │   │   │   │   └── locks.py
 │   │   │   └── dependencies.py         # DB session, common deps
 │   │   ├── services/                   # Business logic
 │   │   │   ├── task_service.py         # Computed fields, tree ops, rollup
-│   │   │   ├── lock_service.py         # Acquire, release, TTL expiry cleanup
+│   │   │   ├── lock_service.py         # Acquire, release, heartbeat, TTL expiry cleanup
 │   │   │   └── sizing_service.py       # Scoring validation, breakdown triggers
 │   │   └── db/
 │   │       ├── session.py              # AsyncSession factory
@@ -546,32 +616,3 @@ chorus/
     └── chorus/
         └── SKILL.md                    # Complete agent skill: API reference, workflow patterns, sizing rubric
 ```
-
-## Implementation Plan
-
-The build order prioritizes proving the agent interaction loop early. The frontend is deferred until the backend and agent integration are validated.
-
-| Phase | Deliverable | Description |
-|---|---|---|
-| Phase 1 | Database + Schema | Docker Compose with PostgreSQL. Alembic migrations for all six entities. SQLAlchemy models with relationships and constraints. |
-| Phase 2 | Core API | FastAPI application with CRUD endpoints for projects, tasks, agents. Business logic services for computed readiness, point rollup (recursive CTE), tree operations. Pydantic schemas for all request/response models. |
-| Phase 3 | Locking + Operations | Lock acquisition with precondition validation, TTL-based expiry, expiry cleanup (background task). Atomic operation endpoints: size, breakdown, refine, approve. State transition validation. Autonomy mode enforcement on all mutation endpoints. |
-| Phase 4 | Agent Skill File | Markdown skill file encoding workflow patterns, sizing rubric, API reference, and autonomy mode guidance. Test with Claude Code: create project, size tasks, break down, implement. |
-| Phase 5 | Frontend | React + Vite application. Task tree view with collapsible hierarchy. Task detail panel. Review queue. Kanban board. Agent activity dashboard. |
-| Phase 6 | Polish + Iterate | Refine based on real usage. Add bulk operations, task search/filter, project-level analytics, export to markdown (TASKS.md in repo). |
-
-## Key Design Decisions
-
-| Decision | Choice | Rationale |
-|---|---|---|
-| Database | PostgreSQL over DuckDB | Multi-agent concurrency requires proper concurrent writes. DuckDB is single-writer. PostgreSQL provides ACID transactions, SELECT FOR UPDATE for locking, and JSONB for flexible scoring data. Docker makes local setup trivial. |
-| Readiness model | Computed from data, not stored | Eliminates dual sources of truth. `needs_refinement` is the only stored flag because it represents a judgment call that cannot be inferred. All other readiness states are derived from `points`, children, and `approved` fields. |
-| Point rollup | Replacement model | Once a task is broken down and children are sized, the children are the source of truth. The parent's original estimate is preserved for context but superseded. This prevents double-counting and makes the hierarchy the canonical sizing. |
-| Operations | Atomic, single-purpose | Agents have limited context windows and no memory between sessions. Atomic operations keep context contained, enable clean handoffs, and allow review gates between steps. |
-| Locking | Pessimistic with TTL expiry | Prevents conflicting concurrent modifications. Purpose-based TTLs handle agent crashes without requiring heartbeats — important because Claude Code and Cursor run as ephemeral sessions that cannot maintain background processes. Lock acquisition checks expiry inline for immediate reclamation. Simpler and more predictable than optimistic concurrency for agent workloads. |
-| Frontend framework | React + Vite over Next.js | No SSR, SEO, or server-side routing needed. This is a dashboard app that talks to a separate API. Vite is lighter weight with faster dev experience. |
-| Autonomy mode | Two modes with API enforcement | `agent` and `manual` modes enforced at the API layer via agent identity, not just advisory flags. Non-human agents receive 403 on manual-mode tasks. Discovery endpoints filter by mode so agents never see work they cannot act on. Override inheritance flows down the task tree, allowing fine-grained control within a project. |
-| Work logs | Separate table, not text field | Multiple agents perform atomic operations. Structured entries with agent, operation, and timestamp enable querying, filtering, and timeline display. Append-only prevents accidental overwrites. |
-| Skills over MCP | Skill files instead of MCP server | A well-written skill file teaches agents the API endpoints, workflow patterns, and sizing rubric — agents make HTTP calls directly. No intermediary process to run or maintain. MCP can be added later if a use case demands it, but for Claude Code and Cursor, skills are sufficient and simpler. |
-| Skills before frontend | Build order prioritizes agent integration | The system's primary users are agents. Proving the agent interaction loop (create -> size -> break down -> implement) is more valuable than a GUI for validating the design. |
-
