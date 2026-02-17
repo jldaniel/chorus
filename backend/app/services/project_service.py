@@ -1,10 +1,11 @@
 import uuid
+from datetime import datetime, timezone
 
-from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.exceptions import ChorusError
 from app.models.base import Status
 from app.models.project import Project
 from app.models.task import Task
@@ -27,7 +28,7 @@ async def list_projects(session: AsyncSession) -> list[Project]:
 async def get_project(session: AsyncSession, project_id: uuid.UUID) -> Project:
     project = await session.get(Project, project_id)
     if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise ChorusError(404, "NOT_FOUND", "Project not found")
     return project
 
 
@@ -85,3 +86,65 @@ async def get_project_tasks(
         .order_by(Task.position)
     )
     return list(result.scalars().all())
+
+
+async def export_project(session: AsyncSession, project_id: uuid.UUID) -> dict:
+    project = await get_project(session, project_id)
+
+    result = await session.execute(
+        select(Task)
+        .where(Task.project_id == project_id)
+        .options(
+            selectinload(Task.work_log_entries),
+            selectinload(Task.commits),
+        )
+        .order_by(Task.position)
+    )
+    tasks = list(result.scalars().all())
+
+    return {
+        "id": project.id,
+        "name": project.name,
+        "description": project.description,
+        "created_at": project.created_at,
+        "updated_at": project.updated_at,
+        "exported_at": datetime.now(timezone.utc),
+        "tasks": [
+            {
+                "id": t.id,
+                "parent_task_id": t.parent_task_id,
+                "name": t.name,
+                "description": t.description,
+                "context": t.context,
+                "task_type": t.task_type,
+                "status": t.status,
+                "points": t.points,
+                "position": t.position,
+                "created_at": t.created_at,
+                "updated_at": t.updated_at,
+                "work_log_entries": [
+                    {
+                        "id": e.id,
+                        "task_id": e.task_id,
+                        "author": e.author,
+                        "operation": e.operation.value if hasattr(e.operation, "value") else e.operation,
+                        "content": e.content,
+                        "created_at": e.created_at,
+                    }
+                    for e in (t.work_log_entries or [])
+                ],
+                "commits": [
+                    {
+                        "id": c.id,
+                        "task_id": c.task_id,
+                        "author": c.author,
+                        "commit_hash": c.commit_hash,
+                        "message": c.message,
+                        "committed_at": c.committed_at,
+                    }
+                    for c in (t.commits or [])
+                ],
+            }
+            for t in tasks
+        ],
+    }

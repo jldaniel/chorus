@@ -1,11 +1,13 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.base import Operation, Status
 from app.models.commit import TaskCommit
+from app.models.idempotency import IdempotencyRecord
 from app.models.task import Task
 from app.models.work_log import WorkLogEntry
 from app.schemas.atomic import (
@@ -17,6 +19,39 @@ from app.schemas.atomic import (
     SizingRequest,
 )
 from app.services.task_service import _task_load_options, get_task
+
+IDEMPOTENCY_TTL = timedelta(hours=24)
+
+
+async def check_idempotency(
+    session: AsyncSession, key: str
+) -> IdempotencyRecord | None:
+    result = await session.execute(
+        select(IdempotencyRecord).where(IdempotencyRecord.key == key)
+    )
+    record = result.scalar_one_or_none()
+    if record and record.expires_at > datetime.now(timezone.utc):
+        return record
+    return None
+
+
+async def store_idempotency(
+    session: AsyncSession, key: str, status_code: int, response_body: dict
+) -> None:
+    now = datetime.now(timezone.utc)
+    record = IdempotencyRecord(
+        key=key,
+        status_code=status_code,
+        response_body=response_body,
+        created_at=now,
+        expires_at=now + IDEMPOTENCY_TTL,
+    )
+    session.add(record)
+    try:
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        # Another request already stored the result; that's fine
 
 
 async def _reload_task(session: AsyncSession, task_id: uuid.UUID) -> Task:

@@ -1,11 +1,11 @@
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.exceptions import ChorusError
 from app.models.base import Status
 from app.models.task import Task
 from app.schemas.task import TaskCreate, TaskUpdate
@@ -101,10 +101,10 @@ async def create_task(
     if parent_task_id:
         parent = await session.get(Task, parent_task_id)
         if not parent:
-            raise HTTPException(status_code=404, detail="Parent task not found")
+            raise ChorusError(404, "NOT_FOUND", "Parent task not found")
         if parent.project_id != project_id:
-            raise HTTPException(
-                status_code=400, detail="Parent task belongs to a different project"
+            raise ChorusError(
+                400, "VALIDATION_ERROR", "Parent task belongs to a different project"
             )
 
     # Auto-assign position
@@ -145,7 +145,7 @@ async def get_task(session: AsyncSession, task_id: uuid.UUID) -> Task:
     )
     task = result.scalar_one_or_none()
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise ChorusError(404, "NOT_FOUND", "Task not found")
     return task
 
 
@@ -218,7 +218,7 @@ async def get_task_ancestry(session: AsyncSession, task_id: uuid.UUID) -> list[T
         task = result.scalar_one_or_none()
         if task is None:
             if current_id == task_id:
-                raise HTTPException(status_code=404, detail="Task not found")
+                raise ChorusError(404, "NOT_FOUND", "Task not found")
             break
         chain.append(task)
         current_id = task.parent_task_id
@@ -246,7 +246,7 @@ async def get_task_context(
     )
     task = result.scalar_one_or_none()
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise ChorusError(404, "NOT_FOUND", "Task not found")
 
     # Capture enriched data and related objects before ancestry query
     # (ancestry reloads same objects and may expire children relationships)
@@ -358,7 +358,7 @@ async def update_task_status(
     )
     task = result.scalar_one_or_none()
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise ChorusError(404, "NOT_FOUND", "Task not found")
 
     old_status = Status(task.status) if isinstance(task.status, str) else task.status
 
@@ -366,9 +366,11 @@ async def update_task_status(
         return task
 
     if new_status not in _VALID_TRANSITIONS.get(old_status, set()):
-        raise HTTPException(
-            status_code=422,
-            detail=f"Invalid transition from {old_status.value} to {new_status.value}",
+        raise ChorusError(
+            422,
+            "INVALID_STATUS_TRANSITION",
+            f"Invalid transition from {old_status.value} to {new_status.value}",
+            {"from": old_status.value, "to": new_status.value},
         )
 
     # To done: all descendants must be terminal, at least one done
@@ -377,14 +379,16 @@ async def update_task_status(
         if has_children:
             all_terminal, any_done = _check_descendants_terminal(task)
             if not all_terminal:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Cannot complete: not all descendants are terminal (done/wont_do)",
+                raise ChorusError(
+                    422,
+                    "INVALID_STATUS_TRANSITION",
+                    "Cannot complete: not all descendants are terminal (done/wont_do)",
                 )
             if not any_done:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Cannot complete: at least one descendant must be done",
+                raise ChorusError(
+                    422,
+                    "INVALID_STATUS_TRANSITION",
+                    "Cannot complete: at least one descendant must be done",
                 )
 
     task.status = new_status

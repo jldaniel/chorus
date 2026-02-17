@@ -312,3 +312,38 @@ async def test_commit_crud(client, task):
     resp = await client.get(f"/tasks/{task['id']}/commits")
     assert resp.status_code == 200
     assert len(resp.json()) == 1
+
+
+# --- Idempotency ---
+
+
+@pytest.mark.asyncio
+async def test_idempotent_size_replay(client, task):
+    key = "test-idem-key-123"
+    payload = _sizing_payload()
+
+    resp1 = await client.post(
+        f"/tasks/{task['id']}/size",
+        json=payload,
+        headers={"Idempotency-Key": key},
+    )
+    assert resp1.status_code == 200
+    data1 = resp1.json()
+
+    # Second request with same key should return cached response
+    resp2 = await client.post(
+        f"/tasks/{task['id']}/size",
+        json=payload,
+        headers={"Idempotency-Key": key},
+    )
+    assert resp2.status_code == 200
+    data2 = resp2.json()
+    assert data1 == data2
+
+
+@pytest.mark.asyncio
+async def test_size_without_idempotency_header(client, task):
+    payload = _sizing_payload()
+    resp = await client.post(f"/tasks/{task['id']}/size", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["points"] == 5

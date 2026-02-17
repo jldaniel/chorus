@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_session
+from app.schemas.export import ProjectExportResponse
 from app.schemas.project import ProjectCreate, ProjectDetail, ProjectRead, ProjectUpdate
 from app.schemas.task import TaskRead
 from app.services import project_service, task_service
@@ -49,6 +50,13 @@ async def delete_project(
 ):
     await project_service.delete_project(session, project_id)
     await session.commit()
+
+
+@router.get("/{project_id}/export", response_model=ProjectExportResponse)
+async def export_project(
+    project_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+):
+    return await project_service.export_project(session, project_id)
 
 
 @router.get("/{project_id}/tasks", response_model=list[TaskRead])

@@ -3,10 +3,10 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import HTTPException
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.exceptions import ChorusError
 from app.models.base import LockPurpose
 from app.models.lock import TaskLock
 from app.models.task import Task
@@ -28,22 +28,26 @@ CLEANUP_INTERVAL_SECONDS = 60
 def validate_lock_precondition(task: Task, purpose: LockPurpose) -> None:
     if purpose == LockPurpose.sizing:
         if task.points is not None:
-            raise HTTPException(status_code=422, detail="Task is already sized")
+            raise ChorusError(422, "INVALID_READINESS_STATE", "Task is already sized")
     elif purpose == LockPurpose.breakdown:
         if task.points is None and not task.children:
-            raise HTTPException(status_code=422, detail="Task must be sized before breakdown")
+            raise ChorusError(422, "INVALID_READINESS_STATE", "Task must be sized before breakdown")
         ep = task_service.compute_effective_points(task)
         unsized = task_service.compute_unsized_children(task)
         if (ep is None or ep <= 6) and unsized == 0:
-            raise HTTPException(
-                status_code=422,
-                detail="Task does not need breakdown (effective_points <= 6 and no unsized children)",
+            raise ChorusError(
+                422,
+                "INVALID_READINESS_STATE",
+                "Task does not need breakdown (effective_points <= 6 and no unsized children)",
             )
     elif purpose == LockPurpose.implementation:
         readiness = task_service.compute_readiness(task)
         if readiness != "ready":
-            raise HTTPException(
-                status_code=422, detail=f"Task is not ready for implementation (readiness={readiness})"
+            raise ChorusError(
+                422,
+                "INVALID_READINESS_STATE",
+                f"Task is not ready for implementation (readiness={readiness})",
+                {"readiness": readiness},
             )
     # refinement: no precondition
 
@@ -62,7 +66,7 @@ async def acquire_lock(
             await session.delete(existing)
             await session.flush()
         else:
-            raise HTTPException(status_code=409, detail="Task is already locked")
+            raise ChorusError(409, "LOCK_CONFLICT", "Task is already locked")
 
     validate_lock_precondition(task, data.lock_purpose)
 
@@ -85,14 +89,14 @@ async def heartbeat_lock(
     result = await session.execute(select(TaskLock).where(TaskLock.task_id == task_id))
     lock = result.scalar_one_or_none()
     if not lock:
-        raise HTTPException(status_code=404, detail="No lock found for this task")
+        raise ChorusError(404, "NOT_FOUND", "No lock found for this task")
 
     now = datetime.now(timezone.utc)
     if lock.expires_at < now:
-        raise HTTPException(status_code=409, detail="Lock has expired")
+        raise ChorusError(409, "LOCK_CONFLICT", "Lock has expired")
 
     if lock.caller_label != caller_label:
-        raise HTTPException(status_code=403, detail="Caller label does not match lock holder")
+        raise ChorusError(403, "VALIDATION_ERROR", "Caller label does not match lock holder")
 
     purpose = LockPurpose(lock.lock_purpose) if isinstance(lock.lock_purpose, str) else lock.lock_purpose
     lock.last_heartbeat_at = now
@@ -107,10 +111,10 @@ async def release_lock(
     result = await session.execute(select(TaskLock).where(TaskLock.task_id == task_id))
     lock = result.scalar_one_or_none()
     if not lock:
-        raise HTTPException(status_code=404, detail="No lock found for this task")
+        raise ChorusError(404, "NOT_FOUND", "No lock found for this task")
 
     if not force and lock.caller_label != caller_label:
-        raise HTTPException(status_code=403, detail="Caller label does not match lock holder")
+        raise ChorusError(403, "VALIDATION_ERROR", "Caller label does not match lock holder")
 
     await session.delete(lock)
     await session.flush()
@@ -119,7 +123,16 @@ async def release_lock(
 async def cleanup_expired_locks(session: AsyncSession) -> int:
     now = datetime.now(timezone.utc)
     result = await session.execute(delete(TaskLock).where(TaskLock.expires_at < now))
-    await session.commit()
+    return result.rowcount
+
+
+async def cleanup_expired_idempotency_records(session: AsyncSession) -> int:
+    from app.models.idempotency import IdempotencyRecord
+
+    now = datetime.now(timezone.utc)
+    result = await session.execute(
+        delete(IdempotencyRecord).where(IdempotencyRecord.expires_at < now)
+    )
     return result.rowcount
 
 
@@ -128,11 +141,15 @@ async def _cleanup_loop(session_factory):
         await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
         try:
             async with session_factory() as session:
-                count = await cleanup_expired_locks(session)
-                if count:
-                    logger.info("Cleaned up %d expired locks", count)
+                lock_count = await cleanup_expired_locks(session)
+                idem_count = await cleanup_expired_idempotency_records(session)
+                await session.commit()
+                if lock_count:
+                    logger.info("Cleaned up %d expired locks", lock_count)
+                if idem_count:
+                    logger.info("Cleaned up %d expired idempotency records", idem_count)
         except Exception:
-            logger.exception("Error during lock cleanup")
+            logger.exception("Error during cleanup")
 
 
 def start_lock_cleanup_task(session_factory):
